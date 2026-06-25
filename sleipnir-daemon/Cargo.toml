@@ -1,0 +1,16 @@
+[package]
+name = "sleipnir-daemon"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sleipnir-core = { path = "../sleipnir-core" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+tracing-subscriber = "0.3"
+ratatui = "0.29.0"
+crossterm = "0.28.1"
+tui-textarea = { version = "0.7.0", features = ["crossterm"] }
