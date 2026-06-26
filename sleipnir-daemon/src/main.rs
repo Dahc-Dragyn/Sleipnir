@@ -1,5 +1,6 @@
 mod server;
 mod ui;
+pub mod policy;
 #[cfg(test)]
 mod server_test;
 
@@ -8,7 +9,6 @@ use sleipnir_core::models::ActionStatus;
 use std::time::Duration;
 use tracing::info;
 use tracing_subscriber::FmtSubscriber;
-use std::env;
 use tui_textarea::TextArea;
 use ui::TerminalGuard;
 
@@ -55,13 +55,62 @@ async fn main() -> std::io::Result<()> {
 
     info!("Sleipnir Daemon initializing...");
     
-    // Use temp_dir for Windows compatibility
-    let socket_path = env::temp_dir().join("sleipnir.sock");
+    #[cfg(windows)]
+    let socket_path = "127.0.0.1:47777".to_string();
+    
+    #[cfg(unix)]
+    let socket_path = std::env::temp_dir().join("sleipnir.sock").to_string_lossy().into_owned();
+    // Initialize PolicyEngine
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use notify::{Watcher, RecursiveMode, EventKind};
+
+    let policy_path = "Policy.toml";
+    if !std::path::Path::new(policy_path).exists() {
+        let default_policy = r#"
+[tools.execute_sql]
+risk_tier = "Verify"
+"#;
+        std::fs::write(policy_path, default_policy.trim()).expect("Failed to write default Policy.toml");
+    }
+
+    let policy_engine = policy::PolicyEngine::load_from_file(policy_path).unwrap_or_default();
+    let policy_arc = Arc::new(RwLock::new(policy_engine));
+
+    // Hot reload watcher
+    let policy_arc_clone = policy_arc.clone();
+    let tx_clone_for_watcher = tx.clone();
+    tokio::spawn(async move {
+        let (tx_notify, mut rx_notify) = tokio::sync::mpsc::channel(1);
+        let mut watcher = notify::recommended_watcher(move |res| {
+            if let Ok(event) = res {
+                let _ = tx_notify.blocking_send(event);
+            }
+        }).unwrap();
+        
+        watcher.watch(std::path::Path::new(policy_path), RecursiveMode::NonRecursive).unwrap();
+
+        while let Some(event) = rx_notify.recv().await {
+            if let notify::Event { kind: EventKind::Modify(_), .. } = event {
+                match policy::PolicyEngine::load_from_file(policy_path) {
+                    Ok(new_engine) => {
+                        let mut lock = policy_arc_clone.write().await;
+                        *lock = new_engine;
+                        let _ = tx_clone_for_watcher.send(ui::UiEvent::NewLog("Policy hot-reloaded successfully".into())).await;
+                    }
+                    Err(e) => {
+                        let _ = tx_clone_for_watcher.send(ui::UiEvent::NewLog(format!("Policy hot-reload failed: {}", e))).await;
+                    }
+                }
+            }
+        }
+    });
     
     let tx_for_server = tx.clone();
+    let policy_for_server = policy_arc.clone();
     // Background the socket server
     tokio::spawn(async move {
-        if let Err(e) = server::start_uds_server(socket_path, tx_for_server).await {
+        if let Err(e) = server::start_uds_server(socket_path, tx_for_server, policy_for_server).await {
             tracing::error!("Server error: {}", e);
         }
     });

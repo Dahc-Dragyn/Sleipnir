@@ -11,21 +11,14 @@ async fn connect_client(path: &std::path::Path) -> impl tokio::io::AsyncRead + t
 }
 
 #[cfg(windows)]
-async fn connect_client(path: &std::path::Path) -> impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {
-    let provided_path = path.to_str().unwrap();
-    let path_str = if provided_path.starts_with(r"\\.\pipe\") {
-        provided_path.to_string()
-    } else {
-        format!(r"\\.\pipe\{}", provided_path.replace("\\", "_").replace(":", "_"))
-    };
-
+async fn connect_client(addr: &str) -> impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {
     loop {
-        match tokio::net::windows::named_pipe::ClientOptions::new().open(&path_str) {
+        match tokio::net::TcpStream::connect(addr).await {
             Ok(client) => return client,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            Err(e) => panic!("Failed to connect to named pipe: {}", e),
+            Err(e) => panic!("Failed to connect to TCP socket: {}", e),
         }
     }
 }
@@ -36,14 +29,15 @@ async fn test_uds_handshake() {
     let socket_path = std::env::temp_dir().join("sleipnir_test.sock");
     
     #[cfg(windows)]
-    let socket_path = std::path::PathBuf::from(r"\\.\pipe\sleipnir_test_sock");
+    let socket_path = "127.0.0.1:47777".to_string();
 
     let path_clone = socket_path.clone();
 
     // Spawn server in background
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let policy = std::sync::Arc::new(tokio::sync::RwLock::new(crate::policy::PolicyEngine::default()));
     tokio::spawn(async move {
-        let _ = start_uds_server(path_clone, tx).await;
+        let _ = start_uds_server(path_clone, tx, policy).await;
     });
 
     // Mock Operator loop
@@ -89,4 +83,61 @@ async fn test_uds_handshake() {
 
     // Verify latency loop
     println!("Handshake roundtrip took: {:?}", duration);
+}
+
+#[tokio::test]
+async fn test_swarm_concurrent_blocks() {
+    use crate::server::handle_connection;
+    use crate::policy::{PolicyEngine, CompiledToolPolicy};
+    use sleipnir_core::models::RiskTier;
+
+    let (tx_ui, mut rx_ui) = tokio::sync::mpsc::channel(32);
+    let mut engine = PolicyEngine::default();
+    engine.tools.insert("execute_sql".into(), CompiledToolPolicy {
+        risk_tier: RiskTier::Verify,
+        patterns: vec![],
+    });
+    let policy_arc = std::sync::Arc::new(tokio::sync::RwLock::new(engine));
+    // Simulate 5 swarm concurrent connections
+    for i in 0..5 {
+        let (mut client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let tx_clone = tx_ui.clone();
+        let policy_clone = policy_arc.clone();
+        
+        tokio::spawn(async move {
+            let _ = handle_connection(server_io, tx_clone, policy_clone).await;
+        });
+        
+        tokio::spawn(async move {
+            let frame = AgentActionFrame {
+                transaction_id: Cow::Owned(format!("tx_{}", i)),
+                agent_id: Cow::Borrowed("agent_alpha"),
+                timestamp: 1000,
+                payload: PayloadType::ToolInvocation {
+                    tool_name: Cow::Borrowed("execute_sql"),
+                    arguments: Cow::Borrowed("{\"query\": \"SELECT * FROM test\"}"),
+                },
+                context_monologue: None,
+            };
+            
+            let serialized = serde_json::to_vec(&frame).unwrap();
+            client_io.write_all(&serialized).await.unwrap();
+        });
+    }
+    
+    let mut block_count = 0;
+    
+    for _ in 0..15 {
+        if let Ok(event) = tokio::time::timeout(std::time::Duration::from_millis(50), rx_ui.recv()).await {
+            if let Some(e) = event {
+                if let UiEvent::IncomingBlock(tx_id, tx_oneshot) = e {
+                    assert!(tx_id.starts_with("tx_"));
+                    block_count += 1;
+                    let _ = tx_oneshot.send((sleipnir_core::models::ActionStatus::Approved, None));
+                }
+            }
+        }
+    }
+    
+    assert_eq!(block_count, 5, "Server dropped frames during concurrency spike!");
 }

@@ -8,25 +8,29 @@ from google.genai import types
 
 def send_to_daemon(json_data):
     if os.name == 'nt':
-        # Windows Named Pipe logic
-        temp_dir = tempfile.gettempdir()
-        sock_path = os.path.join(temp_dir, "sleipnir.sock")
-        pipe_name = r"\\.\pipe\{}".format(sock_path.replace("\\", "_").replace(":", "_"))
-        
-        try:
-            with open(pipe_name, "r+b") as pipe:
-                pipe.write(json_data.encode('utf-8'))
-                pipe.flush()
-                
-                response_data = pipe.read(1024)
-                if response_data:
-                    return json.loads(response_data.decode('utf-8'))
-        except FileNotFoundError:
-            print(f"\n[ERROR] Named pipe {pipe_name} not found. Is the Sleipnir daemon running?")
+        # Windows Local TCP Loopback logic
+        for _ in range(50):
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(2.0)
+                    s.connect(('127.0.0.1', 47777))
+                    s.sendall(json_data.encode('utf-8'))
+                    
+                    response_data = s.recv(1024)
+                    if response_data:
+                        return json.loads(response_data.decode('utf-8'))
+            except Exception as e:
+                # Catch connection errors and retry
+                time.sleep(0.2)
+                continue
+            
+        print(f"\n[WARNING] Local Safe Mode activated: TCP daemon not found at 127.0.0.1:47777 after retries.")
+        return {"status": "Local Safe Mode", "mutated_payload": None}
     else:
         # POSIX Unix Domain Socket logic
         sock_path = os.path.join(tempfile.gettempdir(), "sleipnir.sock")
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(2.0)
             try:
                 s.connect(sock_path)
                 s.sendall(json_data.encode('utf-8'))
@@ -34,8 +38,9 @@ def send_to_daemon(json_data):
                 response_data = s.recv(1024)
                 if response_data:
                     return json.loads(response_data.decode('utf-8'))
-            except FileNotFoundError:
-                print(f"\n[ERROR] Socket {sock_path} not found. Is the Sleipnir daemon running?")
+            except (socket.timeout, FileNotFoundError, ConnectionRefusedError, OSError, BrokenPipeError) as e:
+                print(f"\n[WARNING] Local Safe Mode activated (Daemon disconnected): {e}")
+                return {"status": "Local Safe Mode", "mutated_payload": None}
     return None
 
 def main():

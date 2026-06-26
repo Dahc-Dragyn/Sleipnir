@@ -7,28 +7,24 @@ import threading
 
 def send_to_daemon(json_data):
     if os.name == 'nt':
-        # Windows Named Pipe logic
-        temp_dir = tempfile.gettempdir()
-        sock_path = os.path.join(temp_dir, "sleipnir.sock")
-        pipe_name = r"\\.\pipe\{}".format(sock_path.replace("\\", "_").replace(":", "_"))
-        
-        # Robust retry loop to handle concurrent named pipe connection states on Windows
+        # Windows Local TCP Loopback logic
         retries = 30
         for i in range(retries):
             try:
-                with open(pipe_name, "r+b") as pipe:
-                    pipe.write(json_data.encode('utf-8'))
-                    pipe.flush()
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(2.0)
+                    s.connect(('127.0.0.1', 47777))
+                    s.sendall(json_data.encode('utf-8'))
                     
-                    response_data = pipe.read(1024)
+                    response_data = s.recv(1024)
                     if response_data:
                         return json.loads(response_data.decode('utf-8'))
                     return None
-            except (OSError, FileNotFoundError, PermissionError) as e:
+            except Exception as e:
                 if i == retries - 1:
-                    print(f"\n[ERROR] Failed to connect to named pipe after {retries} attempts: {e}")
+                    print(f"\n[ERROR] Failed to connect to TCP socket after {retries} attempts: {e}")
                 else:
-                    time.sleep(0.05)  # Back off and retry to let the daemon spin up the next pipe instance
+                    time.sleep(0.05)
     else:
         # POSIX Unix Domain Socket logic
         sock_path = os.path.join(tempfile.gettempdir(), "sleipnir.sock")
