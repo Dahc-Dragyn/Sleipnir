@@ -1,7 +1,7 @@
 Test Plan & Test Strategy Document (TPSD)
 Project Sleipnir: Local High-Speed Agent Orchestration Workbench
 
-Author: Chad Nygard Version: v1.0 Status: Approved Baseline Date: June 2026
+Author: Aiyoda.app : v1.0 Status: Approved Baseline Date: June 2026
 
 1. Introduction & Objectives
 This document details the validation strategy, test automation methodologies, and quantitative quality gates
